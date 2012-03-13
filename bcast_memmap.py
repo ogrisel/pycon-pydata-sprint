@@ -1,3 +1,26 @@
+"""
+Optimized broadcast for numpy arrays
+
+Data is sent from the client to each 'datastore' at most once,
+and loaded into memmapped arrays.
+
+In this example, the 'datastore' is the '/tmp' directory on each physical
+machine.
+
+General flow:
+
+0. hash data
+1. query all engines for datastore ID (default: hostname),
+   remote filename as function of hash, and whether data
+   is already present on the machine.
+2. foreach datastore *not* local to the Client, which has not yet seen the data:
+        * send data to one engine with access to the datastore
+        * store in file for memmap loading
+3. on *all* engines, load data as memmapped file from datastore
+
+"""
+
+
 import os
 import sys
 import socket
@@ -17,9 +40,38 @@ def load_memmap(name, fname, dtype, shape):
 def _push(**ns):
     globals().update(ns)
 
-def default_identify():
-    import socket
-    return socket.gethostname(), "/tmp"
+def default_identify(checksum):
+    """default datastore-identification function.
+    
+    Identifies 'datastores' by hostname, and stores data files
+    in /tmp.
+    
+    Parameters
+    ----------
+    
+    checksum : str
+        The md5 hash of the array.  Cached filenames should be
+        a function of this.
+    
+    Returns
+    -------
+    
+    datastore_id : str
+        currently socket.gethostname().  This should identify a
+        locality, wrt. the data storage mechanism.  Data is only
+        transferred to one engine for each datastore_id.
+    
+    filename : path
+        The filename (or url, object id, etc.) for this data to
+        be stored in.  This should be a unique function of the
+        checksum.
+    
+    exists : bool
+        Whether the data is already available in the datastore.
+        """
+    import os,socket
+    fname = os.path.join("/tmp", checksum)
+    return socket.gethostname(), fname, os.path.exists(fname)
 
 
 def save_for_memmap(A, fname):
@@ -36,56 +88,62 @@ def save_for_memmap(A, fname):
     # maybe need to flush?
     # mmA.flush()
 
-def datastore_mapping(view, identify_f):
+def datastore_mapping(view, identify_f, checksum):
     """generate various mappings of datastores and paths"""
-    mapping = dv.apply_async(identify_f).get_dict()
-    here, _ = identify_f()
+    mapping = dv.apply_async(identify_f, checksum).get_dict()
+    here, _, __ = identify_f(checksum)
     
     # reverse mapping, so we have a list of engine IDs per datastore
     revmap = defaultdict(list)
     paths = {}
-    for eid, (datastore_id, path) in mapping.iteritems():
+    for eid, (datastore_id, path, exists) in mapping.iteritems():
         revmap[datastore_id].append(eid)
-        paths[datastore_id] = path
+        paths[datastore_id] = (path, exists)
     
     return here, revmap, paths
 
 def bcast_memmap(view, name, X, identify_f=default_identify):
-    """
+    """broadcast X as memmapped arrays on all engines in the view
     
-    identify_f: 
-        callable that returns string identifier of engine
-        local datastore.  An explicit push will be performed
-        on exactly one engine per unique datastore id.
+    Ultimate result: a memmapped array with the contents of X
+    will be stored in globals()[name] on each engine of the view.
+    
+    Efforts are made to minimize network traffic:
+    
+    * only send to one engine per datastore (host)
+    * only send if data is not already present in each store
+    
+    broadcast X
     """
     client = view.client
-    
-    here, revmap, paths = datastore_mapping(view, identify_f)
-
-    ars = []
-    mm_ars = []
     
     # checksum array for filename
     checksum = md5(X).hexdigest()
     
+    here, revmap, paths = datastore_mapping(view, identify_f, checksum)
+
+    ars = []
+    mm_ars = []
+    
     # perform push to first engine of each non-local datastore:
     for datastore_id, targets in revmap.iteritems():
         if datastore_id != here:
-            # push to first target at datastore
-            e0 = client[targets[0]]
-            ar = e0.apply(_push, **{name : X})
-            # DEBUG:
-            # ar.get()
-            ars.append(ar)
-            
-            targets = targets[1:]
-            # Nothing left to do if only one engine on this machine
-            if not targets:
+            fname, exists = paths[datastore_id]
+            # if file exists, nothing to do this round
+            if exists:
+                print "nothing to send to", datastore_id
                 continue
             
-            fname = os.path.join(paths[datastore_id], checksum)
+            print "sending data to", datastore_id
+            # push to first target at datastore
+            e0 = client[targets[0]]
+            # ar = e0.apply(_push, **{name : X})
+            # # DEBUG:
+            # # ar.get()
+            # ars.append(ar)
+            
             # save to file for memmapping on other engines
-            ar = e0.apply_async(save_for_memmap, parallel.Reference(name), fname)
+            ar = e0.apply_async(save_for_memmap, X, fname)
             ars.append(ar)
             mm_ars.append(ar)
     
@@ -97,12 +155,8 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
     # loop through datastores
     for datastore_id, targets in revmap.iteritems():
         if datastore_id != here:
-            targets = targets[1:]
-            # Nothing left to do if only one engine on this machine
-            if not targets:
-                continue
+            fname, exists = paths[datastore_id]
             
-            fname = os.path.join(paths[datastore_id], checksum)
             # load from memmapped file on engines after the first for this datastore
             other = client[targets]
             ar = other.apply_async(load_memmap, name, fname, X.dtype, X.shape)
@@ -112,8 +166,9 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
             
         else:
             if not isinstance(X, numpy.memmap):
-                fname = os.path.join(paths[datastore_id], checksum)
-                save_for_memmap(X, fname)
+                fname, exists = paths[datastore_id]
+                if not exists:
+                    save_for_memmap(X, fname)
             else:
                 fname = X.filename
             # local engines, load from original memmapped file
@@ -131,21 +186,24 @@ if __name__ == '__main__':
     dv = rc[:]
     with dv.sync_imports():
         import numpy
+        from hashlib import md5
 
     A = numpy.memmap("/tmp/bleargh", dtype=float, shape=(100,128), mode='write')
+    numpy.random.seed(10)
+    # A = numpy.empty((100,128))
     A[:] = numpy.random.random_integers(0,100,A.shape)
     
     here = socket.gethostname()
     
     ars, revmap = bcast_memmap(dv, 'B', A)
     
-    # block to ensure assingment succeeded:
+    # block here to raise any potential exceptions:
     [ ar.get() for ar in ars ]
     
     
     for datastore_id, targets in revmap.iteritems():
         print datastore_id,
-        print rc[targets].apply_sync(lambda : B.__class__.__name__)
+        print rc[targets].apply_sync(lambda : B.filename[:12])
         print datastore_id,
-        print rc[targets].apply_sync(lambda : numpy.linalg.norm(B,2))
+        print rc[targets].apply_sync(lambda : md5(B).hexdigest()[:7])
         # print rc[targets].apply_sync(lambda : )
