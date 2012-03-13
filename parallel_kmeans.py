@@ -28,13 +28,15 @@ def load_data(name, partition_id, n_partitions):
     globals().update({name : part})
     return part.shape
 
+@interactive
 def init_kmeans(data, n_clusters, batch_size):
     
     from sklearn.cluster import MiniBatchKMeans
     
+    global kmeans
     kmeans = MiniBatchKMeans(n_clusters, batch_size=batch_size).partial_fit(data[:batch_size])
     
-    return kmeans
+    # return kmeans
 
 def compute_kmeans(kmeans, data):
     
@@ -44,7 +46,7 @@ def compute_kmeans(kmeans, data):
     
     kmeans.partial_fit(data[x])
     
-    return kmeans
+    # return kmeans
 
 def run_kmeans(view, name, n_clusters, loader, batch_size=100):
     
@@ -52,7 +54,7 @@ def run_kmeans(view, name, n_clusters, loader, batch_size=100):
     n_partitions = len(ids)
     
     rdata = parallel.Reference(name)
-    
+    view.block = False
     view.scatter('partition_id', range(len(ids)), flatten=True)
     partition_id = parallel.Reference('partition_id')
     
@@ -64,37 +66,44 @@ def run_kmeans(view, name, n_clusters, loader, batch_size=100):
     partition_size = max([ shape[0] for shape in load_ar ])
     _, nfeatures = load_ar[0]
     
-    e0 = view.client[ids[0]]
+    rank_ar = view.apply_async(lambda : comm.rank)
+    rankmap = rank_ar.get_dict()
+    for eid,rank in rankmap.iteritems():
+        if rank == 0:
+            e0 = view.client[eid]
+    # ensure name exists
+    view.execute("kmeans=None")
     kmeans_ar = e0.apply_async(init_kmeans, rdata, n_clusters, batch_size)
-
     # DEBUG: block on init
-    kmeans_ar.get()
+    # kmeans_ar.get()
     
-    # FIXME: TEMPORARILY TERRIBLE BROADCAST
     print_flush("Broadcasting initialized kmeans...")
-    view['kmeans'] = kmeans_ar.get()
+    view.execute("kmeans = comm.bcast(kmeans, root=0)")
     print_flush("done.")
     
     rkmeans = parallel.Reference('kmeans')
+    def sync_centers(kmeans, n_partitions):
+        sum_centers = comm.allreduce(kmeans.cluster_centers_, op=MPI.SUM)
+        kmeans.cluster_centers_ = sum_centers / n_partitions
+    
     print_flush("nsteps %s" % (partition_size // batch_size))
     for step in range(partition_size // batch_size):
         print_flush(step)
         ar = view.apply_async(compute_kmeans, rkmeans, rdata)
-        
-        # FIXME: GLOBAL COMM VIA CLIENT
-        # kmeans = ar.get()
-        mean_centers = np.zeros((n_clusters, nfeatures))
-        for km in ar:
-            mean_centers += km.cluster_centers_
-        mean_centers /= len(ar.msg_ids)
-        
-        # FIXME: GLOBAL
-        def new_centers(km, centers):
-            
-            km.cluster_centers_ = 1*centers
-        ar = view.apply_async(new_centers, rkmeans, mean_centers)
+        # debug
+        # ar.get()
+        ar = view.apply_async(sync_centers, rkmeans, n_partitions)
+        # debug
+        # ar.get()
     
-    km.cluster_centers_ = mean_centers
-    
-    return km
+    print_flush("finishing")
+    return e0['kmeans']
+
+def init_mpi(view):
+    # block, so we raise errors immediately
+    view.execute("""from mpi4py import MPI;comm = MPI.COMM_WORLD""", block=True)
+    ar = view.apply_async(lambda : comm.rank)
+    # return IPython id:MPI_RANK mapping
+    return ar.get_dict()
+
 
