@@ -63,18 +63,19 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
     here, revmap, paths = datastore_mapping(view, identify_f)
 
     ars = []
+    mm_ars = []
     
     # checksum array for filename
     checksum = md5(X).hexdigest()
     
+    # perform push to first engine of each non-local datastore:
     for datastore_id, targets in revmap.iteritems():
-        print datastore_id, targets
         if datastore_id != here:
             # push to first target at datastore
             e0 = client[targets[0]]
             ar = e0.apply(_push, **{name : X})
             # DEBUG:
-            ar.get()
+            # ar.get()
             ars.append(ar)
             
             targets = targets[1:]
@@ -85,36 +86,54 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
             fname = os.path.join(paths[datastore_id], checksum)
             # save to file for memmapping on other engines
             ar = e0.apply_async(save_for_memmap, parallel.Reference(name), fname)
-            # for now, this is needed as a sync step
-            # remote barrier on targets+e0 would be preferable
-            # DEBUG:
-            ar.get()
             ars.append(ar)
+            mm_ars.append(ar)
+    
+    # wait on pushes, to ensure files are ready for memmap in next step
+    # this could be done without blocking the client with a barrier
+    # (MPI or ZMQ or file lock, etc.)
+    [ ar.get() for ar in mm_ars ]
+    
+    # loop through datastores
+    for datastore_id, targets in revmap.iteritems():
+        if datastore_id != here:
+            targets = targets[1:]
+            # Nothing left to do if only one engine on this machine
+            if not targets:
+                continue
             
-            # load from memmapped file on other engines on the same machine
+            fname = os.path.join(paths[datastore_id], checksum)
+            # load from memmapped file on engines after the first for this datastore
             other = client[targets]
             ar = other.apply_async(load_memmap, name, fname, X.dtype, X.shape)
             # DEBUG:
-            ar.get()
+            # ar.get()
             ars.append(ar)
             
         else:
-            # local engines, load from original memmap file
-            ar = client[targets].apply_async(reconstruct_memmap, name, X.filename, X.dtype, X.shape)
+            if not isinstance(X, numpy.memmap):
+                fname = os.path.join(paths[datastore_id], checksum)
+                save_for_memmap(X, fname)
+            else:
+                fname = X.filename
+            # local engines, load from original memmapped file
+            ar = client[targets].apply_async(load_memmap, name, fname, X.dtype, X.shape)
             # DEBUG:
-            ar.get()
+            # ar.get()
             ars.append(ar)
             
     return ars, revmap
 
 if __name__ == '__main__':
     import socket
-    import numpy
     
-    
-    A = numpy.memmap("/tmp/bleargh", dtype=float, shape=(100,128), mode='write')
     rc = parallel.Client(profile='vm')
     dv = rc[:]
+    with dv.sync_imports():
+        import numpy
+
+    A = numpy.memmap("/tmp/bleargh", dtype=float, shape=(100,128), mode='write')
+    A[:] = numpy.random.random_integers(0,100,A.shape)
     
     here = socket.gethostname()
     
@@ -127,3 +146,6 @@ if __name__ == '__main__':
     for datastore_id, targets in revmap.iteritems():
         print datastore_id,
         print rc[targets].apply_sync(lambda : B.__class__.__name__)
+        print datastore_id,
+        print rc[targets].apply_sync(lambda : numpy.linalg.norm(B,2))
+        # print rc[targets].apply_sync(lambda : )
