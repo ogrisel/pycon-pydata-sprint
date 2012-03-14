@@ -21,8 +21,6 @@ General flow:
 """
 
 
-import os
-import sys
 import socket
 from collections import defaultdict
 from hashlib import md5
