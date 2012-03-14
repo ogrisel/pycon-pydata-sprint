@@ -21,7 +21,6 @@ General flow:
 """
 
 
-import os
 import sys
 import socket
 from collections import defaultdict
@@ -181,8 +180,13 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
 
 if __name__ == '__main__':
     import socket
+    import sys
+    if len(sys.argv) > 1:
+        profile = sys.argv[1]
+    else:
+        profile = None
     
-    rc = parallel.Client(profile='vm')
+    rc = parallel.Client(profile=profile)
     dv = rc[:]
     with dv.sync_imports():
         import numpy
