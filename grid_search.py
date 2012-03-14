@@ -2,8 +2,6 @@
 
 
 """
-
-
 # Author: MinRK <benjaminrk@gmail.com>
 #         Olivier Grisel <olivier.grisel@gmail.com>
 # License: BSD Style.
@@ -21,13 +19,16 @@ from IPython import parallel
 from sklearn.grid_search import IterGrid
 from sklearn.base import clone, is_classifier
 from sklearn.cross_validation import check_cv
+from sklearn.utils import check_random_state
 
 
 def fit_grid_point(X, y, base_clf, params, train, test, loss_func,
                    score_func, param_id=None):
     """Run fit on one set of parameters
 
-    Returns the score and the instance of the classifier
+    Returns the parameter set identifier, the parameters and the
+    computed score.
+
     """
     # update parameters of the classifier after a copy of its base structure
     clf = copy.deepcopy(base_clf)
@@ -80,10 +81,27 @@ def fit_grid_point(X, y, base_clf, params, train, test, loss_func,
 
 
 class IPythonGridSearchCV(object):
-    """Grid search on the parameters of an estimator w/ a scoring function"""
+    """Grid search on the parameters of an estimator w/ a scoring function
+
+    The grid search runs asynchronously on the engines of the cluster. The
+    client python process can fetch and interact with the partial results
+    of the cluster engines while the computation is ongoing.
+
+    The exploration ordering is randomized as recommended by Bergstra
+    and Bengio 2012:
+
+      http://people.fas.harvard.edu/~bergstra/random-search.html
+      http://jmlr.csail.mit.edu/papers/volume13/bergstra12a/bergstra12a.pdf
+
+    This makes it possible to early introspect the partial results
+    without having the first scores being biased towards any particular
+    area of the search space and also to stop and restart the computation
+    as each job is completely independent of one another.
+
+    """
 
     def __init__(self, estimator, param_grid, loss_func=None, score_func=None,
-                 cv=None, view=None):
+                 randomized=True, cv=None, view=None, random_state=None):
         if not hasattr(estimator, 'fit') or \
            not (hasattr(estimator, 'predict') or hasattr(estimator, 'score')):
             raise TypeError("estimator should a be an estimator implementing"
@@ -105,16 +123,16 @@ class IPythonGridSearchCV(object):
         self.view = view
         self._push_results = None
         self._fit_results = None
+        self.random_state = random_state
+        self.randomized = randomized
 
     def fit_async(self, X, y=None):
         """Run fit asynchronously with all sets of parameters
 
-        Returns the best classifier
-
         Parameters
         ----------
 
-        X: array, [n_samples, n_features]
+        X: array or sparse matrix, [n_samples, n_features]
             Training vector, where n_samples in the number of samples and
             n_features is the number of features.
 
@@ -123,9 +141,15 @@ class IPythonGridSearchCV(object):
             None for unsupervised learning.
 
         """
-        import os
-        import binascii
-        
+        import uuid
+        if self.is_running():
+            raise RuntimeError("Cannot launch new tasks while the previous"
+                               " tasks are still running.")
+
+        self.session_id = "s_" + uuid.uuid4().hex
+        random_state = check_random_state(self.random_state)
+        py_random_state = random.Random(random_state.rand())
+
         estimator = self.estimator
         cv = self.cv
         if hasattr(X, 'shape'):
@@ -142,69 +166,92 @@ class IPythonGridSearchCV(object):
             y = np.asarray(y)
         cv = check_cv(cv, X, y, classifier=is_classifier(estimator))
 
+        self.X, self.y = X, y
+
         grid = IterGrid(self.param_grid)
-        random.shuffle(list(grid))
+        if self.randomized:
+            # shuffle the grid to implement James Bergstra's randomized
+            # search
+            py_random_state.shuffle(list(grid))
+
         base_clf = clone(self.estimator)
-        
-        suffix = binascii.hexlify(os.urandom(10))
-        
+
         @parallel.util.interactive
-        def push_data(X, y, suffix):
+        def push_data(X, y, session_id):
             data = dict(X=X, y=y)
             g = globals()
-            g.update({'data_'+suffix : data})
-        
+            g.update({session_id + '_data': data})
+
         push_ars = []
         ids = self.view.targets or self.view.client.ids
         for id in ids:
             with self.view.temp_flags(targets=[id]):
-                push_ars.append(self.view.apply_async(push_data, X, y, suffix))
-        
+                push_ars.append(self.view.apply_async(
+                    push_data, X, y, self.session_id))
+
         self._push_results = push_ars
-        
+
         self.view.follow = parallel.Dependency(push_ars, all=False)
-        
+
         ars = []
-        rX = parallel.Reference('data_%s["X"]' % suffix)
-        ry = parallel.Reference('data_%s["y"]' % suffix)
+        rX = parallel.Reference('%s_data["X"]' % self.session_id)
+        ry = parallel.Reference('%s_data["y"]' % self.session_id)
         for param_id, clf_params in enumerate(grid):
             for train,test in cv:
                 ars.append(self.view.apply_async(fit_grid_point,
                         rX, ry, base_clf, clf_params, train, test,
                         self.loss_func, self.score_func,
-                        param_id=param_id)
-                )
-        
+                        param_id=param_id))
+
         # clear folllow dep
         self.view.follow = None
-        
+
+        # TODO: cleanup engine namespace using another dependency
         self._fit_results = ars
         return len(ars)
 
-    def collect_results(self):
-        
+    def wait_for_completion(self, timeout=None):
+        """Block until completion of the running tasks"""
+        [ ar.get(timeout) for ar in self._fit_results ]
+
+    def is_running(self):
+        """Return True is there existing unfinished task"""
         if self._fit_results is None:
-            raise RuntimeError("run fit() before collecting its results")
-        
+            return False
+
+        for ar in self._fit_results:
+            if not ar.ready():
+                return True
+
+        return False
+
+    def collect_results(self):
+        """Collect the scores of the  of the
+
+        Return (results, n_remaining).
+        """
+        if self._fit_results is None:
+            raise RuntimeError("Run fit_async before collecting its results")
+
         self.view.spin()
-        
+
         ready_results = [ ar for ar in self._fit_results if ar.ready() ]
         not_ready = [ ar for ar in self._fit_results if not ar.ready() ]
-        
+
         runtime = lambda ar: (ar.completed - ar.started).total_seconds()
-        
+
         grouped_scores = defaultdict(list)
         grouped_durations = defaultdict(list)
         parameters = dict()
         for ar in ready_results:
             param_id, clf_params, this_score = ar.get()
-            
+
             grouped_scores[param_id].append(this_score)
             grouped_durations[param_id].append(runtime(ar))
-            
+
             if param_id not in parameters:
                 parameters[param_id] = clf_params
-        
+
         results = []
         for param_id in grouped_scores:
             scores = grouped_scores[param_id]
@@ -214,10 +261,20 @@ class IPythonGridSearchCV(object):
                  np.mean(scores),
                  np.array(scores),
                  np.mean(durations),
-                 np.array(durations),
-                )
+                 np.array(durations))
             )
-        
+
         # sort by mean score
         results.sort(key=itemgetter(1), reverse=True)
         return results, len(not_ready)
+
+    def refit_best(self):
+        """Fit the best parameter locally on the full dataset"""
+        scores, _ = self.collect_results()
+        if len(scores) == 0:
+            raise RuntimeError("No parameter available")
+        params, _, _, _,  _ = scores[0]
+        model = clone(self.estimator)
+        model.set_params(**params)
+        model.fit(self.X, self.y)
+        return model
