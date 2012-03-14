@@ -5,6 +5,7 @@ from sklearn import datasets
 from sklearn.cross_validation import train_test_split
 from sklearn.metrics import precision_score
 from sklearn.svm import SVC
+from sklearn.metrics import classification_report
 
 from grid_search import IPythonGridSearchCV
 
@@ -30,9 +31,9 @@ tuned_parameters = [{'kernel': ['rbf'], 'gamma': [1e-3, 1e-4],
                      'C': [1, 10, 100, 1000]},
                     {'kernel': ['linear'], 'C': [1, 10, 100, 1000]}]
 
-clf = IPythonGridSearchCV(SVC(C=1), tuned_parameters,
+search = IPythonGridSearchCV(SVC(C=1), tuned_parameters,
                           score_func=precision_score, view=v, cv=5)
-clf.fit_async(X_train, y_train)
+search.fit_async(X_train, y_train)
 print "Launched asynchronous fit on a cluster."
 
 
@@ -43,7 +44,7 @@ def print_scores(scores):
 
 while v.outstanding:
     v.wait(timeout=0.5)
-    completed_scores, n_remaining = clf.collect_results()
+    completed_scores, n_remaining = search.collect_results()
     top_scores = completed_scores[:3]
 
     print "Current top %d parameters on development set:" % len(top_scores)
@@ -54,7 +55,10 @@ while v.outstanding:
 
 print "Final scores:"
 print
-all_scores, _ = clf.collect_results()
+all_scores, _ = search.collect_results()
 print_scores(all_scores)
+print
 
-#TODO: refit the best estimator
+print "Fitting best parameters on the full development set"
+best_clf = search.refit_best()
+print classification_report(y_test, best_clf.predict(X_test))
