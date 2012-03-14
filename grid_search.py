@@ -34,6 +34,8 @@ def fit_grid_point(X, y, base_clf, params, train, test, loss_func,
     clf = copy.deepcopy(base_clf)
     clf.set_params(**params)
 
+    # TODO: factor out the following in scikit-learn and make it possible to
+    # memoize it as a joblib memory mapped file
     if isinstance(X, list) or isinstance(X, tuple):
         X_train = [X[i] for i, cond in enumerate(train) if cond]
         X_test = [X[i] for i, cond in enumerate(test) if cond]
@@ -146,7 +148,7 @@ class IPythonGridSearchCV(object):
             raise RuntimeError("Cannot launch new tasks while the previous"
                                " tasks are still running.")
 
-        self.session_id = "s_" + uuid.uuid4().hex
+        session_id = "s_" + uuid.uuid4().hex
         random_state = check_random_state(self.random_state)
         py_random_state = random.Random(random_state.rand())
 
@@ -176,6 +178,7 @@ class IPythonGridSearchCV(object):
 
         base_clf = clone(self.estimator)
 
+        # push data into engines namespaces
         @parallel.util.interactive
         def push_data(X, y, session_id):
             data = dict(X=X, y=y)
@@ -183,32 +186,48 @@ class IPythonGridSearchCV(object):
             g.update({session_id + '_data': data})
 
         push_ars = []
-        ids = self.view.targets or self.view.client.ids
-        for id in ids:
+        engine_ids = self.view.targets or self.view.client.ids
+        for id in engine_ids:
             with self.view.temp_flags(targets=[id]):
                 push_ars.append(self.view.apply_async(
-                    push_data, X, y, self.session_id))
+                    push_data, X, y, session_id))
 
         self._push_results = push_ars
 
+        # load balance the fit tasks themselves as soon at the data is
+        # available on the any engines using a dependency in the DAG
         self.view.follow = parallel.Dependency(push_ars, all=False)
-
-        ars = []
-        rX = parallel.Reference('%s_data["X"]' % self.session_id)
-        ry = parallel.Reference('%s_data["y"]' % self.session_id)
+        fit_ars = []
+        rX = parallel.Reference('%s_data["X"]' % session_id)
+        ry = parallel.Reference('%s_data["y"]' % session_id)
         for param_id, clf_params in enumerate(grid):
             for train,test in cv:
-                ars.append(self.view.apply_async(fit_grid_point,
+                fit_ars.append(self.view.apply_async(fit_grid_point,
                         rX, ry, base_clf, clf_params, train, test,
                         self.loss_func, self.score_func,
                         param_id=param_id))
 
-        # clear folllow dep
+        # clean up data from engines namespaces
         self.view.follow = None
+        self.view.after = parallel.Dependency(fit_ars, all=True)
 
-        # TODO: cleanup engine namespace using another dependency
-        self._fit_results = ars
-        return len(ars)
+        @parallel.util.interactive
+        def cleanup_namespace(session_id):
+            variable_name = session_id + '_data'
+            g = globals()
+            del g[variable_name]
+
+        cleanup_ars = []
+        for id in engine_ids:
+            with self.view.temp_flags(targets=[id]):
+                cleanup_ars.append(self.view.apply_async(
+                    cleanup_namespace, session_id))
+
+        # clear folllow dep
+        self.view.after = None
+
+        self._fit_results = fit_ars
+        return len(fit_ars)
 
     def wait_for_completion(self, timeout=None):
         """Block until completion of the running tasks"""
