@@ -73,7 +73,6 @@ def default_identify(checksum):
     fname = os.path.join("/tmp", checksum)
     return socket.gethostname(), fname, os.path.exists(fname)
 
-
 def save_for_memmap(A, fname):
     """save array A as memmapped array"""
     import os.path
@@ -181,8 +180,8 @@ def bcast_memmap(view, name, X, identify_f=default_identify):
 
 if __name__ == '__main__':
     import socket
-    
-    rc = parallel.Client(profile='vm')
+    import sys
+    rc = parallel.Client(profile=sys.argv[1])
     dv = rc[:]
     with dv.sync_imports():
         import numpy
