@@ -32,7 +32,8 @@ tuned_parameters = [{'kernel': ['rbf'], 'gamma': [1e-3, 1e-4],
                     {'kernel': ['linear'], 'C': [1, 10, 100, 1000]}]
 
 search = IPythonGridSearchCV(SVC(C=1), tuned_parameters,
-                          score_func=precision_score, view=v, cv=5)
+                             score_func=precision_score, view=v, cv=5,
+                             local_store='/tmp')
 search.fit_async(X_train, y_train)
 print "Launched asynchronous fit on a cluster."
 

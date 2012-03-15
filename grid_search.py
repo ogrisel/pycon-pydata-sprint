@@ -23,7 +23,8 @@ from sklearn.utils import check_random_state
 
 
 def fit_grid_point(X, y, base_clf, params, train, test, loss_func,
-                   score_func, param_id=None):
+                   score_func, param_id=None, local_store=None,
+                   mmap_mode='c'):
     """Run fit on one set of parameters
 
     Returns the parameter set identifier, the parameters and the
@@ -33,42 +34,53 @@ def fit_grid_point(X, y, base_clf, params, train, test, loss_func,
     # update parameters of the classifier after a copy of its base structure
     clf = copy.deepcopy(base_clf)
     clf.set_params(**params)
+    if hasattr(base_clf, 'kernel_function'):
+        # cannot compute the kernel values with custom function
+        raise ValueError(
+            "Cannot use a custom kernel function. "
+            "Precompute the kernel matrix instead.")
+    precomputed_kernel = getattr(base_clf, 'kernel', '') == 'precomputed'
 
-    # TODO: factor out the following in scikit-learn and make it possible to
-    # memoize it as a joblib memory mapped file
-    if isinstance(X, list) or isinstance(X, tuple):
-        X_train = [X[i] for i, cond in enumerate(train) if cond]
-        X_test = [X[i] for i, cond in enumerate(test) if cond]
-    else:
-        if sp.issparse(X):
-            # For sparse matrices, slicing only works with indices
-            # (no masked array). Convert to CSR format for efficiency and
-            # because some sparse formats don't support row slicing.
-            X = sp.csr_matrix(X)
-            ind = np.arange(X.shape[0])
-            train = ind[train]
-            test = ind[test]
-        if hasattr(base_clf, 'kernel_function'):
-            # cannot compute the kernel values with custom function
-            raise ValueError(
-                "Cannot use a custom kernel function. "
-                "Precompute the kernel matrix instead.")
-        if getattr(base_clf, 'kernel', '') == 'precomputed':
-            # X is a precomputed square kernel matrix
-            if X.shape[0] != X.shape[1]:
-                raise ValueError("X should be a square kernel matrix")
-            X_train = X[np.ix_(train, train)]
-            X_test = X[np.ix_(test, train)]
+    def materialize_split(train, test, X, y=None, precomputed_kernel=True):
+        if isinstance(X, list) or isinstance(X, tuple):
+            X_train = [X[i] for i, cond in enumerate(train) if cond]
+            X_test = [X[i] for i, cond in enumerate(test) if cond]
         else:
-            X_train = X[train]
-            X_test = X[test]
-    if y is not None:
-        y_test = y[test]
-        y_train = y[train]
-    else:
-        y_test = None
-        y_train = None
+            if sp.issparse(X):
+                # For sparse matrices, slicing only works with indices
+                # (no masked array). Convert to CSR format for efficiency and
+                # because some sparse formats don't support row slicing.
+                X = sp.csr_matrix(X)
+                ind = np.arange(X.shape[0])
+                train = ind[train]
+                test = ind[test]
+            if precomputed_kernel:
+                # X is a precomputed square kernel matrix
+                if X.shape[0] != X.shape[1]:
+                    raise ValueError("X should be a square kernel matrix")
+                X_train = X[np.ix_(train, train)]
+                X_test = X[np.ix_(test, train)]
+            else:
+                X_train = X[train]
+                X_test = X[test]
+        if y is not None:
+            y_test = y[test]
+            y_train = y[train]
+        else:
+            y_test = None
+            y_train = None
+        return X_train, X_test, y_train, y_test
 
+    if local_store is not None:
+        # use the engine local filesystem to cache the continuously
+        # allocated CV folds using memory mapped arrays that can be shared
+        # across python processes running on the same machine
+        from sklearn.externals.joblib import Memory
+        m = Memory(local_store, mmap_mode=mmap_mode)
+        materialize_split = m.cache(materialize_split)
+
+    X_train, X_test, y_train, y_test = materialize_split(
+        train, test, X, y=y, precomputed_kernel=precomputed_kernel)
     clf.fit(X_train, y_train)
 
     if loss_func is not None:
@@ -103,7 +115,8 @@ class IPythonGridSearchCV(object):
     """
 
     def __init__(self, estimator, param_grid, loss_func=None, score_func=None,
-                 randomized=True, cv=None, view=None, random_state=None):
+                 randomized=True, cv=None, view=None, random_state=None,
+                 local_store=None):
         if not hasattr(estimator, 'fit') or \
            not (hasattr(estimator, 'predict') or hasattr(estimator, 'score')):
             raise TypeError("estimator should a be an estimator implementing"
@@ -127,6 +140,7 @@ class IPythonGridSearchCV(object):
         self._fit_results = None
         self.random_state = random_state
         self.randomized = randomized
+        self.local_store = local_store
 
     def fit_async(self, X, y=None):
         """Run fit asynchronously with all sets of parameters
@@ -201,11 +215,11 @@ class IPythonGridSearchCV(object):
         rX = parallel.Reference('%s_data["X"]' % session_id)
         ry = parallel.Reference('%s_data["y"]' % session_id)
         for param_id, clf_params in enumerate(grid):
-            for train,test in cv:
+            for train, test in cv:
                 fit_ars.append(self.view.apply_async(fit_grid_point,
                         rX, ry, base_clf, clf_params, train, test,
                         self.loss_func, self.score_func,
-                        param_id=param_id))
+                        param_id=param_id, local_store=self.local_store))
 
         # clean up data from engines namespaces
         self.view.follow = None
